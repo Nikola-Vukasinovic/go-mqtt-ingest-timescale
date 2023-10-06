@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
@@ -11,11 +12,21 @@ import (
 	"time"
 
 	mqtt "github.com/eclipse/paho.mqtt.golang"
+	"github.com/jackc/pgx/v4"
+	"github.com/joho/godotenv"
+	_ "github.com/lib/pq"
 	"go.uber.org/zap"
 )
 
 var logger *zap.Logger
 var inCluster bool
+
+var broker string
+var port string
+var user string
+var pass string
+var service string
+var db string
 
 var messagePubHandler mqtt.MessageHandler = func(client mqtt.Client, msg mqtt.Message) {
 	logger.Info("Received a message",
@@ -84,6 +95,26 @@ func NewTlsConfig() *tls.Config {
 	}
 */
 
+func test_tsdb(user string, pass string, port string, db string) {
+	ctx := context.Background()
+	connStr := fmt.Sprintf("postgres://%s:%s@%s:5432/%s", user, pass, service, db) // replace with your connection string
+	conn, err := pgx.Connect(ctx, connStr)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Unable to connect to database: %v\n", err)
+		os.Exit(1)
+	}
+	defer conn.Close(ctx)
+
+	// Run a simple query to check the connection
+	var greeting string
+	err = conn.QueryRow(ctx, "select 'Hello, Timescale!'").Scan(&greeting)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "QueryRow failed: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Println(greeting)
+}
+
 func main() {
 	// Use a preset configuration for the logger
 	var err error
@@ -98,11 +129,12 @@ func main() {
 	//TODO: Add check is local or k8 and adjust broker address for dev/test/stage
 	_, inCluster := os.LookupEnv("KUBERNETES_SERVICE_HOST")
 
-	var broker string
-	var port string
-
 	if inCluster {
 		logger.Info("Running inside k8 cluster")
+		user = os.Getenv("DB_USERNAME")
+		pass = os.Getenv("DB_PASSWORD")
+		service = os.Getenv("SERVICE")
+		db = os.Getenv("DB_NAME")
 		broker = os.Getenv("MQTT_BROKER_HOST")
 		port = os.Getenv("MQTT_BROKER_PORT")
 		// Read the topic name from the environment variable
@@ -112,9 +144,16 @@ func main() {
 			topic = "devices/telemetry"
 		}
 	} else {
+		if err := godotenv.Load(); err != nil {
+			log.Fatalf("Error loading .env file: %v", err)
+		}
 		logger.Info("Running outside k8 cluster")
-		broker = "98.64.51.139"
-		port = "1883"
+		user = os.Getenv("DB_USERNAME")
+		pass = os.Getenv("DB_PASSWORD")
+		service = os.Getenv("SERVICE")
+		db = os.Getenv("DB_NAME")
+		broker = os.Getenv("MQTT_BROKER_HOST")
+		port = os.Getenv("MQTT_BROKER_PORT")
 		topic = "devices/telemetry"
 	}
 
@@ -132,6 +171,8 @@ func main() {
 	}
 
 	subscribe(client, topic)
+
+	test_tsdb(user, pass, service, db)
 
 	// Wait for a signal to exit the program gracefully
 	sigChan := make(chan os.Signal, 1)
