@@ -4,12 +4,13 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"database/sql"
 	"fmt"
 	"log"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
-	"time"
 
 	mqtt "github.com/eclipse/paho.mqtt.golang"
 	"github.com/jackc/pgx/v4"
@@ -20,6 +21,7 @@ import (
 
 var logger *zap.Logger
 var inCluster bool
+var dbclient *sql.DB
 
 var broker string
 var port string
@@ -27,6 +29,7 @@ var user string
 var pass string
 var service string
 var db string
+var qos int
 
 var messagePubHandler mqtt.MessageHandler = func(client mqtt.Client, msg mqtt.Message) {
 	logger.Info("Received a message",
@@ -34,6 +37,9 @@ var messagePubHandler mqtt.MessageHandler = func(client mqtt.Client, msg mqtt.Me
 		zap.ByteString("payload", msg.Payload()),
 		zap.Int32("qos", int32(msg.Qos())),
 	)
+
+	//Insert into TimescaleDB
+	insertMessage(logger, dbclient, msg.Topic(), string(msg.Payload()))
 }
 
 var connectHandler mqtt.OnConnectHandler = func(client mqtt.Client) {
@@ -44,18 +50,8 @@ var connectLostHandler mqtt.ConnectionLostHandler = func(client mqtt.Client, err
 	logger.Info("Connection to broker lost")
 }
 
-func publish(client mqtt.Client) {
-	num := 10
-	for i := 0; i < num; i++ {
-		text := fmt.Sprintf("Message %d", i)
-		token := client.Publish("topic/test", 0, false, text)
-		token.Wait()
-		time.Sleep(time.Second)
-	}
-}
-
-func subscribe(client mqtt.Client, topic string) {
-	token := client.Subscribe(topic, 1, nil)
+func subscribe(client mqtt.Client, qos byte, topic string) {
+	token := client.Subscribe(topic, qos, messagePubHandler)
 	token.Wait()
 	logger.Info("Subscribed to topic:", zap.String("topic", topic))
 }
@@ -137,6 +133,7 @@ func main() {
 		db = os.Getenv("DB_NAME")
 		broker = os.Getenv("MQTT_BROKER_HOST")
 		port = os.Getenv("MQTT_BROKER_PORT")
+		qos, _ = strconv.Atoi(os.Getenv("MQTT_QOS"))
 		// Read the topic name from the environment variable
 		topic = os.Getenv("MQTT_BROKER_SUB_TOPIC")
 		if topic == "" {
@@ -154,14 +151,13 @@ func main() {
 		db = os.Getenv("DB_NAME")
 		broker = os.Getenv("MQTT_BROKER_HOST")
 		port = os.Getenv("MQTT_BROKER_PORT")
+		qos, _ = strconv.Atoi(os.Getenv("MQTT_QOS"))
 		topic = "devices/telemetry"
 	}
 
 	opts := mqtt.NewClientOptions()
 	opts.AddBroker(fmt.Sprintf("mqtt://%s:%s", broker, port))
-	opts.SetClientID("go_mqtt_client_2")
-	//opts.SetUsername("emqx")
-	//opts.SetPassword("public")
+	opts.SetClientID("test_dev_ingestion")
 	opts.SetDefaultPublishHandler(messagePubHandler)
 	opts.OnConnect = connectHandler
 	opts.OnConnectionLost = connectLostHandler
@@ -170,9 +166,13 @@ func main() {
 		panic(token.Error())
 	}
 
-	subscribe(client, topic)
-
 	test_tsdb(user, pass, service, db)
+
+	dbclient, err = openDBConnection(logger, db, user, pass, port)
+
+	if err != nil {
+		subscribe(client, byte(qos), topic)
+	}
 
 	// Wait for a signal to exit the program gracefully
 	sigChan := make(chan os.Signal, 1)
