@@ -1,82 +1,100 @@
 package main
 
 import (
-	"database/sql"
+	"context"
 	"fmt"
-	"log"
-	"time"
+	"os"
+	"strings"
 
+	"github.com/jackc/pgx/v4"
+	"github.com/jackc/pgx/v4/pgxpool"
 	"go.uber.org/zap"
 )
 
-// Function for establishing connection to Timescale database
-func openDBConnection(logger *zap.Logger, db, user, pass, port string) (*sql.DB, error) {
-	connStr := fmt.Sprintf("user=%s password=%s dbname=%s port=%s sslmode=disable", user, pass, db, port)
-	dbc, err := sql.Open("postgres", connStr)
+// Function for establishing connection connection to Timescale DB using context
+func connectDb(logger *zap.Logger, ctx context.Context, connectionString string) (*pgxpool.Pool, error) {
+	config, err := pgxpool.ParseConfig(connectionString)
 	if err != nil {
-		logger.Error("Error opening database connection", zap.Error(err))
-		return nil, fmt.Errorf("error opening database connection: %v", err)
+		logger.Error("Error while parsing config from connection string")
+		return nil, err
 	}
-
-	// Check the connection
-	err = dbc.Ping()
+	pool, err := pgxpool.ConnectConfig(ctx, config)
 	if err != nil {
-		logger.Error("Error connecting to the database", zap.Error(err))
-		return nil, fmt.Errorf("error connecting to the database: %v", err)
+		logger.Error("Error while connecting to DB")
+		return nil, err
 	}
-
-	return dbc, err
+	logger.Info("Succeffully connected to DB")
+	return pool, nil
 }
 
-func dataOps(logger *zap.Logger) error {
-	db, err := sql.Open("postgres", "postgres://admin@localhost/postgres?sslmode=disable")
-	if err != nil {
+// Create table if not exists using pool
+func createTableIfNotExists(logger *zap.Logger, db *pgxpool.Pool, tableName string, tableSchema string) error {
+	query := fmt.Sprintf("CREATE TABLE IF NOT EXISTS %s (%s)", tableName, tableSchema)
+	if _, err := db.Exec(context.Background(), query); err != nil {
+		logger.Error("Failed to create table", zap.String("table_name", tableName), zap.String("table_schema", tableSchema), zap.Error(err))
 		return err
 	}
-	defer db.Close()
-
-	schemaName := "your_schema_name"
-	tableName := "your_table_name"
-
-	createTableQuery := `
-		CREATE SCHEMA IF NOT EXISTS ` + schemaName + `;
-		CREATE TABLE IF NOT EXISTS ` + schemaName + `.` + tableName + ` (
-			id SERIAL PRIMARY KEY,
-			column1 VARCHAR(255),
-			column2 INTEGER,
-			created_at TIMESTAMP
-		);
-	`
-
-	if _, err := db.Exec(createTableQuery); err != nil {
-		return err
-	}
-
-	log.Println("Table created successfully")
-
+	logger.Info("Table created successfully", zap.String("table_name", tableName))
 	return nil
 }
 
-// InsertMessage inserts an MQTT message into the TimescaleDB table.
-func insertMessage(logger *zap.Logger, db *sql.DB, topic, payload string) error {
-	stmt, err := db.Prepare("INSERT INTO your_table (topic, payload, timestamp) VALUES ($1, $2, $3)")
-	if err != nil {
-		logger.Error("Error preparing SQL statement", zap.Error(err))
-		return fmt.Errorf("error preparing SQL statement: %v", err)
+// Function for inserting data into database using pool
+func insertIntoDB(logger *zap.Logger, db *pgxpool.Pool, messageBuffer chan []byte, tableName string, colName string) {
+	for {
+		select {
+		case payload := <-messageBuffer:
+			if db != nil {
+				query := fmt.Sprintf("INSERT INTO %s (%s) VALUES ($1)", tableName, colName)
+				_, err := db.Exec(context.Background(), query, string(payload))
+				if err != nil {
+					logger.Error("Failed to insert data into the database", zap.Error(err))
+				} else {
+					logger.Info("Data inserted into the database")
+				}
+			}
+		}
 	}
-	defer stmt.Close()
+}
 
-	_, err = stmt.Exec(topic, payload, time.Now())
+// Function to get schema of table
+func getTableSchema(db *pgxpool.Pool, tableName string) (string, error) {
+	var schema strings.Builder
+
+	query := fmt.Sprintf("SELECT column_name, data_type FROM information_schema.columns WHERE table_name = $1")
+	rows, err := db.Query(context.Background(), query, tableName)
 	if err != nil {
-		logger.Error("Error executing SQL statement", zap.Error(err))
-		return fmt.Errorf("error executing SQL statement: %v", err)
+		return "", err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var columnName, dataType string
+		if err := rows.Scan(&columnName, &dataType); err != nil {
+			return "", err
+		}
+		schema.WriteString(fmt.Sprintf("%s %s, ", columnName, dataType))
 	}
 
-	logger.Info("Inserted message into TimescaleDB",
-		zap.String("topic", topic),
-		zap.String("payload", payload),
-		zap.Time("timestamp", time.Now()),
-	)
+	return schema.String(), nil
+}
 
-	return err
+func test_tsdb(user string, pass string, port string, service string, db string) {
+	ctx := context.Background()
+	connStr := fmt.Sprintf("postgres://%s:%s@%s:5432/%s", user, pass, service, db) // replace with your connection string
+	conn, err := pgx.Connect(ctx, connStr)
+
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Unable to connect to database: %v\n", err)
+		os.Exit(1)
+	}
+	defer conn.Close(ctx)
+
+	// Run a simple query to check the connection
+	var greeting string
+	err = conn.QueryRow(ctx, "select 'Hello, Timescale!'").Scan(&greeting)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "QueryRow failed: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Println(greeting)
 }

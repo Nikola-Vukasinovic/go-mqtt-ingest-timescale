@@ -2,126 +2,55 @@ package main
 
 import (
 	"context"
-	"crypto/tls"
-	"crypto/x509"
-	"database/sql"
 	"fmt"
 	"log"
 	"os"
-	"os/signal"
 	"strconv"
-	"syscall"
 
-	mqtt "github.com/eclipse/paho.mqtt.golang"
-	"github.com/jackc/pgx/v4"
+	MQTT "github.com/eclipse/paho.mqtt.golang"
 	"github.com/joho/godotenv"
 	_ "github.com/lib/pq"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 )
 
-var logger *zap.Logger
-var inCluster bool
-var dbclient *sql.DB
-
-var broker string
-var port string
-var user string
-var pass string
-var service string
-var db string
-var qos int
-
-var messagePubHandler mqtt.MessageHandler = func(client mqtt.Client, msg mqtt.Message) {
-	logger.Info("Received a message",
-		zap.String("topic", msg.Topic()),
-		zap.ByteString("payload", msg.Payload()),
-		zap.Int32("qos", int32(msg.Qos())),
-	)
-
-	//Insert into TimescaleDB
-	insertMessage(logger, dbclient, msg.Topic(), string(msg.Payload()))
-}
-
-var connectHandler mqtt.OnConnectHandler = func(client mqtt.Client) {
-	logger.Info("Connected to broker")
-}
-
-var connectLostHandler mqtt.ConnectionLostHandler = func(client mqtt.Client, err error) {
-	logger.Info("Connection to broker lost")
-}
-
-func subscribe(client mqtt.Client, qos byte, topic string) {
-	token := client.Subscribe(topic, qos, messagePubHandler)
-	token.Wait()
-	logger.Info("Subscribed to topic:", zap.String("topic", topic))
-}
-
-// Create TLS config for client
-func NewTlsConfig() *tls.Config {
-	certpool := x509.NewCertPool()
-	ca, err := os.ReadFile("ca.pem")
-	if err != nil {
-		log.Fatalln(err.Error())
-	}
-	certpool.AppendCertsFromPEM(ca)
-	// Import client certificate/key pair
-	clientKeyPair, err := tls.LoadX509KeyPair("client-crt.pem", "client-key.pem")
-	if err != nil {
-		panic(err)
-	}
-	return &tls.Config{
-		RootCAs:            certpool,
-		ClientAuth:         tls.NoClientCert,
-		ClientCAs:          nil,
-		InsecureSkipVerify: true,
-		Certificates:       []tls.Certificate{clientKeyPair},
-	}
-}
-
-/*
-	func NewTlsConfig() *tls.Config {
-	    certpool := x509.NewCertPool()
-	    ca, err := os.ReadFile("ca.pem")
-	    if err != nil {
-	        log.Fatalln(err.Error())
-	    }
-	    certpool.AppendCertsFromPEM(ca)
-	    return &tls.Config{
-	        RootCAs: certpool,
-	}
-*/
-
-func test_tsdb(user string, pass string, port string, db string) {
-	ctx := context.Background()
-	connStr := fmt.Sprintf("postgres://%s:%s@%s:5432/%s", user, pass, service, db) // replace with your connection string
-	conn, err := pgx.Connect(ctx, connStr)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Unable to connect to database: %v\n", err)
-		os.Exit(1)
-	}
-	defer conn.Close(ctx)
-
-	// Run a simple query to check the connection
-	var greeting string
-	err = conn.QueryRow(ctx, "select 'Hello, Timescale!'").Scan(&greeting)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "QueryRow failed: %v\n", err)
-		os.Exit(1)
-	}
-	fmt.Println(greeting)
-}
-
 func main() {
+	//Runtime vars
+	var logger *zap.Logger
+	//var dbPool *pgxpool.Pool
+	//var ctx *context.Context
+	//Buffer channel for MQTT messages
+	//TODO Make buffer size conf from env
+	MSG_BUFF_SIZE := 67108864 //64 MB
+	var messageBuffer = make(chan []byte, MSG_BUFF_SIZE)
+	//Create context
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	// Use a preset configuration for the logger
 	var err error
 	var topic string
 
-	logger, err = zap.NewProduction()
-	defer logger.Sync() // Flush any buffered log entries
+	// Configure the logger with a timestamp
+	logConfig := zap.NewProductionConfig()
+	logConfig.EncoderConfig.TimeKey = "time"
+	logConfig.EncoderConfig.EncodeTime = zapcore.ISO8601TimeEncoder
+
+	logger, err = logConfig.Build()
 
 	if err != nil {
-		panic(err)
+		panic("Failed to create logger")
 	}
+	defer logger.Sync() // Flush any buffered log entries
+
+	//Env vars
+	var broker string
+	var port string
+	var user string
+	var pass string
+	var service string
+	var db string
+	var qos int
+
 	//TODO: Add check is local or k8 and adjust broker address for dev/test/stage
 	_, inCluster := os.LookupEnv("KUBERNETES_SERVICE_HOST")
 
@@ -154,31 +83,47 @@ func main() {
 		qos, _ = strconv.Atoi(os.Getenv("MQTT_QOS"))
 		topic = "devices/telemetry"
 	}
+	//Use default port number 5432
+	connString := fmt.Sprintf("postgres://%s:%s@%s/%s", user, pass, service, db)
+	dbPool, err := connectDb(logger, ctx, connString)
+	tableName := "iot"
+	col := "data"
+	schema := "id SERIAL PRIMARY KEY, data TEXT"
 
-	opts := mqtt.NewClientOptions()
+	//Check if table exists if not create it
+	err = createTableIfNotExists(logger, dbPool, tableName, schema)
+	if err != nil {
+		logger.Error("Error while creating ", zap.String("table:", tableName))
+		//panic(err)
+	}
+	// Start a goroutine to handle the MQTT messages
+	opts := MQTT.NewClientOptions()
 	opts.AddBroker(fmt.Sprintf("mqtt://%s:%s", broker, port))
 	opts.SetClientID("test_dev_ingestion")
-	opts.SetDefaultPublishHandler(messagePubHandler)
-	opts.OnConnect = connectHandler
-	opts.OnConnectionLost = connectLostHandler
-	client := mqtt.NewClient(opts)
+	opts.OnConnect = connectHandler(logger)
+	opts.OnConnectionLost = connectLostHandler(logger)
+	opts.SetDefaultPublishHandler(messagePubHandler(logger, messageBuffer))
+	client := MQTT.NewClient(opts)
+
 	if token := client.Connect(); token.Wait() && token.Error() != nil {
 		panic(token.Error())
 	}
+	// Subscribe to your MQTT topic
+	if token := client.Subscribe(topic, byte(qos), messagePubHandler(logger, messageBuffer)); token.Wait() && token.Error() != nil {
+		logger.Error("Failed to subscribe to the MQTT topic", zap.Error(token.Error()))
+		return
+	}
+	logger.Info("Subscribed to the MQTT topic")
 
-	test_tsdb(user, pass, service, db)
+	// Start the goroutine to insert messages into the database
+	go insertIntoDB(logger, dbPool, messageBuffer, tableName, col)
 
-	dbclient, err = openDBConnection(logger, db, user, pass, port)
-
-	if err != nil {
-		subscribe(client, byte(qos), topic)
+	// Keep the main goroutine running until canceled
+	select {
+	case <-ctx.Done():
+		logger.Warn("Shutting down app")
 	}
 
-	// Wait for a signal to exit the program gracefully
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-	<-sigChan
-
-	client.Unsubscribe(topic)
-	client.Disconnect(500)
+	/*client.Unsubscribe(topic)
+	client.Disconnect(500)*/
 }
