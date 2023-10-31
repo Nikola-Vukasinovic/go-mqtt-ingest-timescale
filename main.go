@@ -17,12 +17,11 @@ import (
 func main() {
 	//Runtime vars
 	var logger *zap.Logger
-	//var dbPool *pgxpool.Pool
-	//var ctx *context.Context
 	//Buffer channel for MQTT messages
 	//TODO Make buffer size conf from env
 	MSG_BUFF_SIZE := 67108864 //64 MB
 	var messageBuffer = make(chan []byte, MSG_BUFF_SIZE)
+	dataBuffer := make(chan PQA_Message, 1000)
 	//Create context
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -66,7 +65,7 @@ func main() {
 		// Read the topic name from the environment variable
 		topic = os.Getenv("MQTT_BROKER_SUB_TOPIC")
 		if topic == "" {
-			logger.Warn("MQTT_TOPIC environment variable is not set or empty. Using default topic devices/telemetry.")
+			logger.Warn("MQTT_BROKER_SUB_TOPIC environment variable is not set or empty. Using default topic devices/telemetry.")
 			topic = "devices/telemetry"
 		}
 	} else {
@@ -84,17 +83,37 @@ func main() {
 		topic = "devices/telemetry"
 	}
 	//Use default port number 5432
-	connString := fmt.Sprintf("postgres://%s:%s@%s/%s", user, pass, service, db)
-	dbPool, err := connectDb(logger, ctx, connString)
-	tableName := "iot"
-	col := "data"
-	schema := "id SERIAL PRIMARY KEY, data TEXT"
+	connString := fmt.Sprintf("postgres://%s:%s@%s:5432/%s", user, pass, service, db)
+	dbPool, err := connectDb(logger, &ctx, connString)
+	defer dbPool.Close()
+	tableName := "sensor_data"
+	queryCreateHypertable := fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %[1]s (
+		time TIMESTAMPTZ NOT NULL,
+		device_id TEXT,
+		slave_id TEXT,
+		date TIMESTAMP,
+		address INTEGER,
+		value REAL NOT NULL,
+		key TEXT NOT NULL
+		);
+		SELECT create_hypertable('%[1]s', 'time');`, tableName)
 
-	//Check if table exists if not create it
-	err = createTableIfNotExists(logger, dbPool, tableName, schema)
+	exists, err := tableExists(dbPool, tableName)
 	if err != nil {
-		logger.Error("Error while creating ", zap.String("table:", tableName))
-		//panic(err)
+		logger.Error("Error while checking if the table exists:", zap.Error(err))
+		return
+	}
+
+	if !exists {
+		//Create if not exists hypertable
+		logger.Info("Table %s does not exist in DB, creating ...", zap.String("table", tableName))
+		err = createHyper(logger, dbPool, queryCreateHypertable)
+		//TODO Handle table creation failure more gracefully
+		if err != nil {
+			ctx.Done()
+		}
+	} else {
+		logger.Info("Table %s already exists in DB", zap.String("table", tableName))
 	}
 	// Start a goroutine to handle the MQTT messages
 	opts := MQTT.NewClientOptions()
@@ -113,17 +132,24 @@ func main() {
 		logger.Error("Failed to subscribe to the MQTT topic", zap.Error(token.Error()))
 		return
 	}
+
 	logger.Info("Subscribed to the MQTT topic")
+	//Start the go routine to parse messages
+	go unmarshallMsg(logger, messageBuffer, dataBuffer)
+	//Start the go routine to batch insert messages
+	//go batchInsert(logger, dbPool, 20, 20, "sensor_data")
+	go batchInsertDb(logger, dbPool, dataBuffer, 20, "sensor_data")
 
-	// Start the goroutine to insert messages into the database
-	go insertIntoDB(logger, dbPool, messageBuffer, tableName, col)
+	for {
+		select {
+		/*case payload := <-messageBuffer:
+		logger.Info("Recieved %s", zap.String("payload:", string(payload)))*/
 
-	// Keep the main goroutine running until canceled
-	select {
-	case <-ctx.Done():
-		logger.Warn("Shutting down app")
+		case <-ctx.Done():
+			client.Unsubscribe(topic)
+			client.Disconnect(500)
+			logger.Warn("Shutting down app")
+			return
+		}
 	}
-
-	/*client.Unsubscribe(topic)
-	client.Disconnect(500)*/
 }
