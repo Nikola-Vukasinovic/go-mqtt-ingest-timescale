@@ -17,6 +17,7 @@ import (
 func main() {
 	//Runtime vars
 	var logger *zap.Logger
+	var err error
 	//Buffer channel for MQTT messages
 	//TODO Make buffer size conf from env
 	MSG_BUFF_SIZE := 67108864 //64 MB
@@ -25,9 +26,6 @@ func main() {
 	//Create context
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	// Use a preset configuration for the logger
-	var err error
-	var topic string
 
 	// Configure the logger with a timestamp
 	logConfig := zap.NewProductionConfig()
@@ -43,6 +41,7 @@ func main() {
 
 	//Env vars
 	var broker string
+	var topic string
 	var port string
 	var user string
 	var pass string
@@ -115,7 +114,7 @@ func main() {
 	} else {
 		logger.Info("Table %s already exists in DB", zap.String("table", tableName))
 	}
-	// Start a goroutine to handle the MQTT messages
+	// Configure MQTT client
 	opts := MQTT.NewClientOptions()
 	opts.AddBroker(fmt.Sprintf("mqtt://%s:%s", broker, port))
 	opts.SetClientID("test_dev_ingestion")
